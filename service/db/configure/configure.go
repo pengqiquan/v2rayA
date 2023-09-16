@@ -34,10 +34,11 @@ func New() *Configure {
 		Setting:          NewSetting(),
 		Accounts:         map[string]string{},
 		Ports: Ports{
-			Socks5:      20170,
-			Http:        20171,
-			HttpWithPac: 20172,
-			Vmess:       0,
+			Socks5:        20170,
+			Socks5WithPac: 0,
+			Http:          20171,
+			HttpWithPac:   20172,
+			Vmess:         0,
 		},
 		InternalDnsList: nil,
 		ExternalDnsList: nil,
@@ -220,6 +221,7 @@ func GetPortsNotNil() *Ports {
 		p = new(Ports)
 		p.Socks5 = 20170
 		p.Http = 20171
+		p.Socks5WithPac = 0
 		p.HttpWithPac = 20172
 		p.Vmess = 0
 	}
@@ -401,7 +403,7 @@ func GetOutboundSetting(outbound string) (setting OutboundSetting) {
 	err := db.Get(fmt.Sprintf("outbound.%v", outbound), "setting", &setting)
 	if err != nil {
 		return OutboundSetting{
-			ProbeURL:      "http://www.msftconnecttest.com/connecttest.txt",
+			ProbeURL:      "https://gstatic.com/generate_204",
 			ProbeInterval: "10s",
 			Type:          LeastPing,
 		}

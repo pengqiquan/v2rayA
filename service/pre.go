@@ -1,28 +1,24 @@
 package main
 
 import (
-	"errors"
 	"fmt"
+	"github.com/gin-gonic/gin"
 	jsonIteratorExtra "github.com/json-iterator/go/extra"
-	"github.com/tidwall/gjson"
 	"github.com/v2rayA/v2rayA/common/netTools/ports"
-	"github.com/v2rayA/v2rayA/common/resolv"
 	"github.com/v2rayA/v2rayA/conf"
+	"github.com/v2rayA/v2rayA/core/ipforward"
 	"github.com/v2rayA/v2rayA/core/v2ray"
 	"github.com/v2rayA/v2rayA/core/v2ray/asset"
-	"github.com/v2rayA/v2rayA/core/v2ray/asset/gfwlist"
+	"github.com/v2rayA/v2rayA/core/v2ray/asset/dat"
 	service2 "github.com/v2rayA/v2rayA/core/v2ray/service"
 	"github.com/v2rayA/v2rayA/core/v2ray/where"
 	"github.com/v2rayA/v2rayA/db"
 	"github.com/v2rayA/v2rayA/db/configure"
 	"github.com/v2rayA/v2rayA/pkg/util/copyfile"
-	"github.com/v2rayA/v2rayA/pkg/util/gopeed"
 	"github.com/v2rayA/v2rayA/pkg/util/log"
 	"github.com/v2rayA/v2rayA/server/router"
 	"github.com/v2rayA/v2rayA/server/service"
-	"io"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -32,13 +28,21 @@ import (
 	"time"
 )
 
+import (
+	confv4 "github.com/v2rayA/v2rayA-lib4/conf"
+	touchv4 "github.com/v2rayA/v2rayA-lib4/core/touch"
+	configurev4 "github.com/v2rayA/v2rayA-lib4/db/configure"
+	servicev4 "github.com/v2rayA/v2rayA-lib4/server/service"
+)
+
 func checkEnvironment() {
 	config := conf.GetEnvironmentConfig()
 	if len(config.PrintReport) > 0 {
+		db.SetReadOnly()
 		config.Report()
 		os.Exit(0)
 	}
-	if !config.PassCheckRoot || config.ResetPassword {
+	if !config.PassCheckRoot {
 		if os.Getegid() != 0 {
 			log.Fatal("Please execute this program with sudo or as a root user for the best experience.\n" +
 				"If you are sure you are root user, use the --passcheckroot parameter to skip the check.\n" +
@@ -49,11 +53,13 @@ func checkEnvironment() {
 		}
 	}
 	if config.ResetPassword {
+		fmt.Println("Config directory:", config.Config)
+		fmt.Println("Resetting password...\nIf no response for a long time, please stop other v2rayA instances and try again.")
 		err := configure.ResetAccounts()
 		if err != nil {
 			log.Fatal("checkEnvironment: %v", err)
 		}
-		fmt.Println("It will work after you restart v2rayA")
+		fmt.Println("Succeed. It will work after you restart v2rayA.")
 		os.Exit(0)
 	}
 	_, v2rayAListeningPort, err := net.SplitHostPort(config.Address)
@@ -62,7 +68,7 @@ func checkEnvironment() {
 	}
 	if occupied, sockets, err := ports.IsPortOccupied([]string{v2rayAListeningPort + ":tcp"}); occupied {
 		if err != nil {
-			log.Fatal("netstat:", err)
+			log.Fatal("netstat: %v", err)
 		}
 		for _, socket := range sockets {
 			process, err := socket.Process()
@@ -92,27 +98,67 @@ func initDBValue() {
 }
 
 func initConfigure() {
-	//等待网络连通
-	v2ray.CheckAndStopTransparentProxy()
-	for {
-		addrs, err := resolv.LookupHost("apple.com")
-		if err == nil && len(addrs) > 0 {
-			break
-		}
-		log.Alert("waiting for network connected")
-		time.Sleep(5 * time.Second)
-	}
-	log.Alert("network is connected")
 	//初始化配置
 	jsonIteratorExtra.RegisterFuzzyDecoders()
 
 	//db
-	confPath := conf.GetEnvironmentConfig().Config
-	if _, err := os.Stat(confPath); os.IsNotExist(err) {
-		_ = os.MkdirAll(filepath.Dir(confPath), os.ModeDir|0750)
-	}
-	if configure.IsConfigureNotExists() {
-		initDBValue()
+	dbPath := filepath.Join(conf.GetEnvironmentConfig().Config, "bolt.db")
+	if _, e := os.Lstat(dbPath); os.IsNotExist(e) {
+		//confv4.SetConfig(confv4.Params{Config: conf.GetEnvironmentConfig().Config})
+		// need to migrate?
+		if !configurev4.IsConfigureNotExists() {
+			// There is different format in server and subscription.
+			// So we keep other content and reimport servers and subscriptions.
+			log.Warn("Migrating from v4 to feat_v5")
+			if err := copyfile.CopyFileContent(filepath.Join(
+				confv4.GetEnvironmentConfig().Config,
+				"boltv4.db",
+			), filepath.Join(
+				conf.GetEnvironmentConfig().Config,
+				"bolt.db",
+			)); err != nil {
+				log.Fatal("Failed to copy boltv4.db to bolt.db: %v", err)
+			}
+
+			// clear connects of outbounds
+			for _, out := range configure.GetOutbounds() {
+				_ = configure.ClearConnects(out)
+			}
+			var indexes []int
+			for i := 0; i < configurev4.GetLenServers(); i++ {
+				indexes = append(indexes, i)
+			}
+			_ = configure.RemoveServers(indexes)
+
+			indexes = nil
+			for i := 0; i < configurev4.GetLenSubscriptions(); i++ {
+				indexes = append(indexes, i)
+			}
+			_ = configure.RemoveSubscriptions(indexes)
+
+			// migrate servers and subscriptions
+			t := touchv4.GenerateTouch()
+			subs := configurev4.GetSubscriptionsV2()
+			for _, sub := range subs {
+				log.Info("Importing subscription: %v", sub.Address)
+				if e := service.Import(sub.Address, nil); e != nil {
+					log.Warn("Failed to migrate subscription: %v", sub.Address)
+				}
+			}
+			for iSvr := range t.Servers {
+				if addr, e := servicev4.GetSharingAddress(&configurev4.Which{
+					TYPE: configurev4.ServerType,
+					ID:   iSvr + 1,
+				}); e == nil {
+					if e := service.Import(addr, nil); e != nil {
+						log.Warn("Failed to migrate server: %v", addr)
+					}
+				}
+			}
+			log.Warn("Migration is done")
+		} else {
+			initDBValue()
+		}
 	}
 	//检查config.json是否存在
 	if _, err := os.Stat(asset.GetV2rayConfigPath()); err != nil {
@@ -124,51 +170,44 @@ func initConfigure() {
 	//首先确定v2ray是否存在
 	if _, err := where.GetV2rayBinPath(); err == nil {
 		//检查geoip、geosite是否存在
-		if !asset.IsGeoipExists() || !asset.IsGeositeExists() {
-			assetDir := asset.GetV2rayLocationAsset()
-			dld := func(repo, remoteFilename, localFilename string) (err error) {
-				log.Warn("downloading %v to %v", remoteFilename, assetDir)
-				p := filepath.Join(os.TempDir(), remoteFilename)
-				resp, err := http.Get("https://api.github.com/repos/" + repo + "/tags")
-				if err != nil {
-					return
-				}
-				defer resp.Body.Close()
-				b, err := io.ReadAll(resp.Body)
-				if err != nil {
-					return
-				}
-				tag := gjson.GetBytes(b, "0.name").String()
-				u := fmt.Sprintf("https://cdn.jsdelivr.net/gh/%v@%v/%v", repo, tag, remoteFilename)
-				err = gopeed.Down(&gopeed.Request{
-					Method: "GET",
-					URL:    u,
-				}, p)
-				if err != nil {
-					return errors.New("download<" + p + ">: " + err.Error())
-				}
-				err = os.Chmod(p, os.FileMode(0755))
-				if err != nil {
-					return errors.New("chmod: " + err.Error())
-				}
-				return copyfile.CopyFile(p, filepath.Join(assetDir, localFilename))
+		if !asset.DoesV2rayAssetExist("geoip.dat") || !asset.DoesV2rayAssetExist("geosite.dat") {
+			log.Alert("downloading missing geoip.dat and geosite.dat")
+			var l net.Listener
+			if l, err = net.Listen("tcp", conf.GetEnvironmentConfig().Address); err != nil {
+				log.Fatal("net.Listen: %v", err)
 			}
-			err := dld("v2rayA/dist-geoip", "geoip.dat", "geoip.dat")
-			if err != nil {
-				log.Warn("initConfigure: v2rayA/dist-geoip: %v", err)
+			e := gin.New()
+			e.GET("/", func(c *gin.Context) {
+				c.Header("Cache-Control", "no-cache, no-store, max-age=0, must-revalidate")
+				c.Header("Pragma", "no-cache")
+				c.Header("Expires", "0")
+				c.String(200, "Downloading missing geoip.dat and geosite.dat; refresh the page later.\n正在下载缺失的 geoip.dat 和 geosite.dat，请稍后刷新页面。")
+			})
+			go e.RunListener(l)
+			if !asset.DoesV2rayAssetExist("geoip.dat") {
+				err := dat.UpdateLocalGeoIP()
+				if err != nil {
+					log.Fatal("UpdateLocalGeoIP: %v", err)
+				}
 			}
-			err = dld("v2rayA/dist-domain-list-community", "dlc.dat", "geosite.dat")
-			if err != nil {
-				log.Warn("initConfigure: v2rayA/dist-domain-list-community: %v", err)
+			if !asset.DoesV2rayAssetExist("geosite.dat") {
+				err = dat.UpdateLocalGeoSite()
+				if err != nil {
+					log.Fatal("UpdateLocalGeoSite: %v", err)
+				}
 			}
+			if l != nil {
+				l.Close()
+			}
+			log.Alert("geoip.dat and geosite.dat are ready")
 		}
 	}
 }
 
 func hello() {
-	log.Alert("V2RayLocationAsset is %v", asset.GetV2rayLocationAsset())
 	v2rayPath, _ := where.GetV2rayBinPath()
 	log.Alert("V2Ray binary is %v", v2rayPath)
+	log.Alert("V2Ray asset directory is %v", asset.GetV2rayLocationAssetOverride())
 	wd, _ := os.Getwd()
 	log.Alert("v2rayA working directory is %v", wd)
 	log.Alert("v2rayA configuration directory is %v", conf.GetEnvironmentConfig().Config)
@@ -207,7 +246,7 @@ func initUpdatingTicker() {
 	conf.TickerUpdateSubscription = time.NewTicker(24 * time.Hour * 365 * 100)
 	go func() {
 		for range conf.TickerUpdateGFWList.C {
-			_, err := gfwlist.CheckAndUpdateGFWList()
+			_, err := dat.CheckAndUpdateGFWList()
 			if err != nil {
 				log.Info("[AutoUpdate] GFWList: %v", err)
 			}
@@ -237,7 +276,7 @@ func checkUpdate() {
 		case configure.GfwlistMode:
 			go func() {
 				/* 更新LoyalsoldierSite.dat */
-				localGFWListVersion, err := gfwlist.CheckAndUpdateGFWList()
+				localGFWListVersion, err := dat.CheckAndUpdateGFWList()
 				if err != nil {
 					log.Warn("Failed to update PAC file: %v", err.Error())
 					return
@@ -277,10 +316,21 @@ func checkUpdate() {
 func run() (err error) {
 	//判别需要启动v2ray吗
 	if configure.GetRunning() {
+		//configure the ip forward
+		setting := service.GetSetting()
+		if setting.IpForward != ipforward.IsIpForwardOn() {
+			e := ipforward.WriteIpForward(setting.IpForward)
+			if e != nil {
+				log.Warn("Connect: %v", e)
+			}
+		}
+		// Start.
 		err := v2ray.UpdateV2RayConfig()
 		if err != nil {
 			log.Error("failed to start v2ray-core: %v", err)
 		}
+	} else {
+		log.Info("the core was not running the last time v2rayA exited")
 	}
 	//w := configure.GetConnectedServers()
 	//log.Println(err, ", which:", w)
@@ -301,7 +351,7 @@ func run() (err error) {
 		log.Fatal("run: %v", err)
 	}
 	fmt.Println("Quitting...")
-	v2ray.CheckAndStopTransparentProxy()
+	v2ray.ProcessManager.CheckAndStopTransparentProxy(nil)
 	v2ray.ProcessManager.Stop(false)
 	_ = db.DB().Close()
 	return nil

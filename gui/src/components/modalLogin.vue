@@ -1,5 +1,5 @@
 <template>
-  <div class="modal-card" style="max-width: 450px;margin:auto">
+  <div class="modal-card" style="max-width: 450px; margin: auto">
     <header class="modal-card-head">
       <p class="modal-card-title">
         {{ first ? $t("register.title") : `${$t("login.title")} - v2rayA` }}
@@ -7,7 +7,7 @@
     </header>
     <section class="modal-card-body">
       <p style="text-align: center">
-        <img src="../assets/logo2.png" alt="v2rayA" />
+        <img src="@/assets/img/logo2.png" alt="v2rayA" />
       </p>
       <b-field :label="$t('login.username')" type="is-success">
         <b-input
@@ -42,7 +42,7 @@
 </template>
 
 <script>
-import { handleResponse } from "../assets/js/utils";
+import { handleResponse } from "@/assets/js/utils";
 import i18n from "@/plugins/i18n";
 
 export default {
@@ -51,12 +51,12 @@ export default {
   props: {
     first: {
       type: Boolean,
-      default: false
-    }
+      default: false,
+    },
   },
   data: () => ({
     username: "",
-    password: ""
+    password: "",
   }),
   mounted() {
     this.$refs.username.focus();
@@ -70,9 +70,9 @@ export default {
           method: "post",
           data: {
             username: this.username,
-            password: this.password
-          }
-        }).then(res => {
+            password: this.password,
+          },
+        }).then((res) => {
           handleResponse(res, this, () => {
             localStorage["token"] = res.data.data.token;
             this.$emit("close");
@@ -86,9 +86,9 @@ export default {
           method: "post",
           data: {
             username: this.username,
-            password: this.password
-          }
-        }).then(res => {
+            password: this.password,
+          },
+        }).then((res) => {
           handleResponse(res, this, () => {
             localStorage["token"] = res.data.data.token;
             this.$emit("close");
@@ -99,8 +99,8 @@ export default {
     },
     handleEnter() {
       this.handleClickSubmit();
-    }
-  }
+    },
+  },
 };
 </script>
 

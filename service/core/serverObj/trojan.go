@@ -2,12 +2,13 @@ package serverObj
 
 import (
 	"fmt"
-	"github.com/v2rayA/v2rayA/common"
-	"github.com/v2rayA/v2rayA/core/coreObj"
 	"net"
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/v2rayA/v2rayA/common"
+	"github.com/v2rayA/v2rayA/core/coreObj"
 )
 
 func init() {
@@ -56,13 +57,13 @@ func ParseTrojanURL(u string) (data *Trojan, err error) {
 	}
 	port, err := strconv.Atoi(t.Port())
 	if err != nil {
-		return nil, InvalidParameterErr
+		return nil, ErrInvalidParameter
 	}
 	data = &Trojan{
 		Name:          t.Fragment,
 		Server:        t.Hostname(),
 		Port:          port,
-		Password:      t.User.String(),
+		Password:      t.User.Username(),
 		Sni:           sni,
 		AllowInsecure: allowInsecure == "1" || allowInsecure == "true",
 		Protocol:      "trojan",
@@ -126,8 +127,8 @@ func (t *Trojan) Configuration(info PriorInfo) (c Configuration, err error) {
 					}},
 				},
 			},
-			PluginChain:  strings.Join(chain, ","),
-			UDPSupport:   true,
+			PluginChain: strings.Join(chain, ","),
+			UDPSupport:  true,
 		}, nil
 	}
 	core := coreObj.OutboundObject{
@@ -180,7 +181,7 @@ func (t *Trojan) ExportToURL() string {
 	return u.String()
 }
 
-func (t *Trojan) NeedPlugin() bool {
+func (t *Trojan) NeedPluginPort() bool {
 	return t.Protocol == "trojan-go"
 }
 

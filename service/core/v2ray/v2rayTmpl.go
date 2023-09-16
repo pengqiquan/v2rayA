@@ -5,13 +5,23 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
+	"os"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
 	jsoniter "github.com/json-iterator/go"
 	"github.com/mohae/deepcopy"
 	"github.com/v2rayA/RoutingA"
 	"github.com/v2rayA/v2rayA/common"
+	"github.com/v2rayA/v2rayA/common/antiPollution"
 	"github.com/v2rayA/v2rayA/common/netTools/netstat"
 	"github.com/v2rayA/v2rayA/common/netTools/ports"
-	"github.com/v2rayA/v2rayA/common/resolv"
 	"github.com/v2rayA/v2rayA/conf"
 	"github.com/v2rayA/v2rayA/core/coreObj"
 	"github.com/v2rayA/v2rayA/core/iptables"
@@ -22,15 +32,6 @@ import (
 	"github.com/v2rayA/v2rayA/db/configure"
 	"github.com/v2rayA/v2rayA/pkg/plugin"
 	"github.com/v2rayA/v2rayA/pkg/util/log"
-	"net"
-	"net/url"
-	"os"
-	"regexp"
-	"sort"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
 )
 
 type Template struct {
@@ -48,12 +49,19 @@ type Template struct {
 	MultiObservatory *coreObj.MultiObservatory `json:"multiObservatory,omitempty"`
 	API              *coreObj.APIObject        `json:"api,omitempty"`
 
-	CoreVersion  string             `json:"-"`
-	Plugins      []plugin.Server    `json:"-"`
-	OutboundTags []string           `json:"-"`
-	ApiCloses    []func()           `json:"-"`
-	ApiPort      int                `json:"-"`
-	Setting      *configure.Setting `json:"-"`
+	Variant               where.Variant       `json:"-"`
+	CoreVersion           string              `json:"-"`
+	Plugins               []plugin.Server     `json:"-"`
+	OutboundTags          []string            `json:"-"`
+	ApiCloses             []func()            `json:"-"`
+	ApiPort               int                 `json:"-"`
+	Setting               *configure.Setting  `json:"-"`
+	PluginManagerInfoList []PluginManagerInfo `json:"-"`
+}
+
+type PluginManagerInfo struct {
+	Link string
+	Port int
 }
 
 func (t *Template) Close() error {
@@ -284,7 +292,7 @@ func (t *Template) setDNS(outbounds []serverInfo, supportUDP map[string]bool) (r
 			break
 		case configure.AntipollutionDnsForward:
 			if firstUDPSupportedOutboundTag != "" {
-				external = []string{"8.8.8.8 -> " + firstUDPSupportedOutboundTag, "1.1.1.1 -> " + firstUDPSupportedOutboundTag}
+				external = antiPollution.GetExternalDNS(firstUDPSupportedOutboundTag)
 			} else {
 				external = []string{"tcp://dns.opendns.com:5353 -> " + firstOutboundTag, "tcp://dns.google -> " + firstOutboundTag}
 			}
@@ -319,24 +327,13 @@ func (t *Template) setDNS(outbounds []serverInfo, supportUDP map[string]bool) (r
 	}
 
 	// fakedns
-	if t.FakeDns != nil {
-		ds := coreObj.DnsServer{
-			Address: "fakedns",
-			Domains: []string{
-				"domain:use-fakedns.com",
+	if specialMode.ShouldUseFakeDns() {
+		t.DNS.Servers = append([]interface{}{
+			"fakedns",
+			coreObj.DnsServer{
+				Address: "fakedns", Domains: []string{"geosite:cn"},
 			},
-		}
-		if asset.LoyalsoldierSiteDatExists() {
-			// use more accurate list to avoid misadventure
-			ds.Domains = append(ds.Domains, "ext:LoyalsoldierSite.dat:gfw")
-		} else {
-			ds.Domains = append(ds.Domains, "geosite:geolocation-!cn")
-		}
-		if len(t.DNS.Servers) == 0 {
-			log.Error("[Fakedns]: NOT REASONABLE. Please report your config.")
-			t.DNS.Servers = append(t.DNS.Servers, "localhost")
-		}
-		t.DNS.Servers = append(t.DNS.Servers, ds)
+		}, t.DNS.Servers...)
 	}
 
 	if t.DNS.Servers == nil {
@@ -354,7 +351,6 @@ func (t *Template) setDNS(outbounds []serverInfo, supportUDP map[string]bool) (r
 		}
 	}
 	domainsToLookup = common.Deduplicate(domainsToLookup)
-	var domainsToHosts []string
 	if len(domainsToLookup) > 0 {
 		var dnsList []string
 		dnsList = []string{
@@ -365,53 +361,29 @@ func (t *Template) setDNS(outbounds []serverInfo, supportUDP map[string]bool) (r
 		t.DNS.Servers = append(t.DNS.Servers, d...)
 		routing = append(routing, r...)
 	}
-	// set hosts
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	ech := make(chan error, len(domainsToHosts))
-	for _, domain := range domainsToHosts {
-		wg.Add(1)
-		go func(domain string) {
-			defer wg.Done()
-			ips, err := resolv.LookupHost(domain)
-			if err != nil {
-				ech <- fmt.Errorf("%w: please make sure you're connected to the Internet", err)
-				return
-			}
-			ips = FilterIPs(ips)
-			mu.Lock()
-			if t.DNS.Hosts == nil {
-				t.DNS.Hosts = make(coreObj.Hosts)
-			}
-			t.DNS.Hosts[domain] = ips
-			mu.Unlock()
-		}(domain)
-	}
-	wg.Wait()
-	select {
-	case err = <-ech:
-		return nil, err
-	default:
-		// deduplicate
-		strRouting := make([]string, 0, len(routing))
-		for _, r := range routing {
-			b, err := jsoniter.Marshal(r)
-			if err != nil {
-				log.Fatal("%v", err)
-			}
-			strRouting = append(strRouting, string(b))
+	// hard code for SNI problem like apple pushing
+	t.DNS.Hosts = make(coreObj.Hosts)
+	t.DNS.Hosts["courier.push.apple.com"] = []string{"1-courier.push.apple.com"}
+
+	// deduplicate
+	strRouting := make([]string, 0, len(routing))
+	for _, r := range routing {
+		b, err := jsoniter.Marshal(r)
+		if err != nil {
+			return nil, fmt.Errorf("jsoniter.Marshal: %v", err)
 		}
-		strRouting = common.Deduplicate(strRouting)
-		routing = routing[:0]
-		for _, sr := range strRouting {
-			var r coreObj.RoutingRule
-			if err := jsoniter.Unmarshal([]byte(sr), &r); err != nil {
-				log.Fatal("%v: %v", err, sr)
-			}
-			routing = append(routing, r)
-		}
-		return routing, nil
+		strRouting = append(strRouting, string(b))
 	}
+	strRouting = common.Deduplicate(strRouting)
+	routing = routing[:0]
+	for _, sr := range strRouting {
+		var r coreObj.RoutingRule
+		if err := jsoniter.Unmarshal([]byte(sr), &r); err != nil {
+			return nil, fmt.Errorf("jsoniter.Unmarshal: RoutingRule: %v", err)
+		}
+		routing = append(routing, r)
+	}
+	return routing, nil
 }
 
 // FilterIPs returns filtered IP list.
@@ -454,17 +426,8 @@ func (t *Template) setDNSRouting(routing []coreObj.RoutingRule, supportUDP map[s
 		}
 		t.Routing.Rules = append(t.Routing.Rules, dnsOut)
 	}
-	if specialMode.ShouldUseSupervisor() || specialMode.ShouldUseFakeDns() {
-		t.Routing.Rules = append(t.Routing.Rules,
-			coreObj.RoutingRule{
-				Type:        "field",
-				IP:          []string{"198.18.0.0/15"},
-				OutboundTag: firstOutboundTag,
-			},
-		)
-	}
 	if !supportUDP[firstOutboundTag] {
-		// find a outbound that supports UDP and redirect all leaky UDP traffic to it
+		// find an outbound that supports UDP and redirect all leaky UDP traffic to it
 		var found bool
 		for outbound, support := range supportUDP {
 			if support {
@@ -490,7 +453,7 @@ func (t *Template) setDNSRouting(routing []coreObj.RoutingRule, supportUDP map[s
 			)
 		}
 	} else {
-		if setting.Transparent != configure.TransparentClose {
+		if IsTransparentOn(setting) {
 			t.Routing.Rules = append(t.Routing.Rules,
 				coreObj.RoutingRule{
 					Type:        "field",
@@ -508,15 +471,22 @@ func (t *Template) setDNSRouting(routing []coreObj.RoutingRule, supportUDP map[s
 
 func (t *Template) AppendRoutingRuleByMode(mode configure.RulePortMode, inbounds []string) (err error) {
 	firstOutboundTag, _ := t.FirstProxyOutboundName(nil)
+	// apple pushing. #495 #479
+	t.Routing.Rules = append(t.Routing.Rules, coreObj.RoutingRule{
+		Type:        "field",
+		OutboundTag: "direct",
+		InboundTag:  deepcopy.Copy(inbounds).([]string),
+		Domain:      []string{"domain:push-apple.com.akadns.net", "domain:push.apple.com"},
+	})
 	switch mode {
 	case configure.WhitelistMode:
 		// foreign domains with intranet IP should be proxied first rather than directly connected
-		if asset.LoyalsoldierSiteDatExists() {
+		if asset.DoesV2rayAssetExist("LoyalsoldierSite.dat") {
 			t.Routing.Rules = append(t.Routing.Rules,
 				coreObj.RoutingRule{
 					Type:        "field",
 					OutboundTag: firstOutboundTag,
-					InboundTag:  inbounds,
+					InboundTag:  deepcopy.Copy(inbounds).([]string),
 					Domain:      []string{"ext:LoyalsoldierSite.dat:geolocation-!cn"},
 				})
 		} else {
@@ -524,43 +494,50 @@ func (t *Template) AppendRoutingRuleByMode(mode configure.RulePortMode, inbounds
 				coreObj.RoutingRule{
 					Type:        "field",
 					OutboundTag: firstOutboundTag,
-					InboundTag:  inbounds,
+					InboundTag:  deepcopy.Copy(inbounds).([]string),
 					Domain:      []string{"geosite:geolocation-!cn"},
 				})
 		}
 		t.Routing.Rules = append(t.Routing.Rules,
 			coreObj.RoutingRule{
 				Type:        "field",
+				OutboundTag: "proxy",
+				InboundTag:  deepcopy.Copy(inbounds).([]string),
+				// https://github.com/v2rayA/v2rayA/issues/285
+				Domain: []string{"geosite:google"},
+			},
+			coreObj.RoutingRule{
+				Type:        "field",
 				OutboundTag: "direct",
-				InboundTag:  inbounds,
+				InboundTag:  deepcopy.Copy(inbounds).([]string),
 				Domain:      []string{"geosite:cn"},
 			},
 			coreObj.RoutingRule{
 				Type:        "field",
 				OutboundTag: "proxy",
-				InboundTag:  inbounds,
+				InboundTag:  deepcopy.Copy(inbounds).([]string),
 				IP:          []string{"geoip:hk", "geoip:mo"},
 			},
 			coreObj.RoutingRule{
 				Type:        "field",
 				OutboundTag: "direct",
-				InboundTag:  inbounds,
+				InboundTag:  deepcopy.Copy(inbounds).([]string),
 				IP:          []string{"geoip:private", "geoip:cn"},
 			},
 		)
 	case configure.GfwlistMode:
-		if asset.LoyalsoldierSiteDatExists() {
+		if asset.DoesV2rayAssetExist("LoyalsoldierSite.dat") {
 			t.Routing.Rules = append(t.Routing.Rules,
 				coreObj.RoutingRule{
 					Type:        "field",
 					OutboundTag: firstOutboundTag,
-					InboundTag:  inbounds,
+					InboundTag:  deepcopy.Copy(inbounds).([]string),
 					Domain:      []string{"ext:LoyalsoldierSite.dat:gfw"},
 				},
 				coreObj.RoutingRule{
 					Type:        "field",
 					OutboundTag: firstOutboundTag,
-					InboundTag:  inbounds,
+					InboundTag:  deepcopy.Copy(inbounds).([]string),
 					Domain:      []string{"ext:LoyalsoldierSite.dat:greatfire"},
 				})
 		} else {
@@ -568,19 +545,29 @@ func (t *Template) AppendRoutingRuleByMode(mode configure.RulePortMode, inbounds
 				coreObj.RoutingRule{
 					Type:        "field",
 					OutboundTag: firstOutboundTag,
-					InboundTag:  inbounds,
+					InboundTag:  deepcopy.Copy(inbounds).([]string),
 					Domain:      []string{"geosite:geolocation-!cn"},
 				})
 		}
+
 		t.Routing.Rules = append(t.Routing.Rules,
 			coreObj.RoutingRule{
 				Type:        "field",
+				OutboundTag: firstOutboundTag,
+				InboundTag:  deepcopy.Copy(inbounds).([]string),
+				// From: https://github.com/Loyalsoldier/geoip/blob/release/text/telegram.txt
+				IP: []string{"91.105.192.0/23", "91.108.4.0/22", "91.108.8.0/21", "91.108.16.0/21", "91.108.56.0/22",
+					"95.161.64.0/20", "149.154.160.0/20", "185.76.151.0/24", "2001:67c:4e8::/48", "2001:b28:f23c::/47",
+					"2001:b28:f23f::/48", "2a0a:f280:203::/48"},
+			},
+			coreObj.RoutingRule{
+				Type:        "field",
 				OutboundTag: "direct",
-				InboundTag:  inbounds,
+				InboundTag:  deepcopy.Copy(inbounds).([]string),
 			},
 		)
 	case configure.RoutingAMode:
-		if err := parseRoutingA(t, inbounds); err != nil {
+		if err := parseRoutingA(t, deepcopy.Copy(inbounds).([]string)); err != nil {
 			return err
 		}
 	}
@@ -588,7 +575,9 @@ func (t *Template) AppendRoutingRuleByMode(mode configure.RulePortMode, inbounds
 }
 
 func (t *Template) setRulePortRouting() error {
-	return t.AppendRoutingRuleByMode(t.Setting.RulePortMode, []string{"rule"})
+	// append rule-http and rule-socks no mather if they are enabled
+	// because "The Same as the Rule Port" may need them
+	return t.AppendRoutingRuleByMode(t.Setting.RulePortMode, []string{"rule-http", "rule-socks"})
 }
 func parseRoutingA(t *Template, routingInboundTags []string) error {
 	lines := strings.Split(configure.GetRoutingA(), "\n")
@@ -675,9 +664,23 @@ func parseRoutingA(t *Template, routingInboundTags []string) error {
 									UDP: false,
 								},
 								Sniffing: coreObj.Sniffing{
-									Enabled:      true,
+									Enabled:      false,
 									DestOverride: []string{"http", "tls"},
 								},
+							}
+							if sniffing := proto.NamedParams["sniffing"]; len(sniffing) > 0 {
+								// support inbound:a=socks(address: 127.0.0.1, port: 1080, sniffing:tls, sniffing:http)
+								// support inbound:a=http(address: 127.0.0.1, port: 1081, sniffing:"http,tls")
+								in.Sniffing.Enabled = true
+								var sniffs []string
+								for _, sniff := range sniffing {
+									fields := strings.Split(sniff, ",")
+									for i := range fields {
+										fields[i] = strings.TrimSpace(fields[i])
+									}
+									sniffs = append(sniffs, fields...)
+								}
+								in.Sniffing.DestOverride = sniffs
 							}
 							if proto.Name == "socks" {
 								if len(server.Users) > 0 {
@@ -757,14 +760,32 @@ func parseRoutingA(t *Template, routingInboundTags []string) error {
 								rr.Domain = append(rr.Domain, v)
 								continue
 							}
+							if k == "ext" {
+								datFilenameAndTag := strings.SplitN(v, ":", 2)
+								if len(datFilenameAndTag) < 2 {
+									return fmt.Errorf("%v: tag is not given", v)
+								}
+								if !asset.DoesV2rayAssetExist(datFilenameAndTag[0]) {
+									return fmt.Errorf("%v: file is not found", datFilenameAndTag[0])
+								}
+							}
 							rr.Domain = append(rr.Domain, fmt.Sprintf("%v:%v", k, v))
 						}
 					}
-					//this is not recommended
+					// unnamed param is not recommended
 					rr.Domain = append(rr.Domain, f.Params...)
 				case "ip":
 					for k, vv := range f.NamedParams {
 						for _, v := range vv {
+							if k == "ext" {
+								datFilenameAndTag := strings.SplitN(v, ":", 2)
+								if len(datFilenameAndTag) < 2 {
+									return fmt.Errorf("%v: tag is not given", v)
+								}
+								if !asset.DoesV2rayAssetExist(datFilenameAndTag[0]) {
+									return fmt.Errorf("%v: file is not found", datFilenameAndTag[0])
+								}
+							}
 							rr.IP = append(rr.IP, fmt.Sprintf("%v:%v", k, v))
 						}
 					}
@@ -796,7 +817,7 @@ func parseRoutingA(t *Template, routingInboundTags []string) error {
 	t.Routing.Rules = append(t.Routing.Rules, coreObj.RoutingRule{
 		Type:        "field",
 		OutboundTag: defaultOutbound,
-		InboundTag:  []string{"rule"},
+		InboundTag:  []string{"rule-http", "rule-socks"},
 	})
 	return nil
 }
@@ -813,7 +834,7 @@ func (t *Template) setTransparentRouting() (err error) {
 		for i := range t.Routing.Rules {
 			ok := false
 			for _, in := range t.Routing.Rules[i].InboundTag {
-				if in == "rule" {
+				if in == "rule-http" {
 					ok = true
 					break
 				}
@@ -825,7 +846,7 @@ func (t *Template) setTransparentRouting() (err error) {
 	}
 	return nil
 }
-func (t *Template) AppendDokodemo(tproxy *string, port int, tag string) {
+func (t *Template) AppendDokodemoTProxy(tproxy string, port int, tag string) {
 	dokodemo := coreObj.Inbound{
 		Listen:   "0.0.0.0",
 		Port:     port,
@@ -837,11 +858,8 @@ func (t *Template) AppendDokodemo(tproxy *string, port int, tag string) {
 		Settings: &coreObj.InboundSettings{Network: "tcp,udp"},
 		Tag:      tag,
 	}
-	if tproxy != nil {
-		dokodemo.StreamSettings = &coreObj.StreamSettings{Sockopt: &coreObj.Sockopt{Tproxy: tproxy}}
-		dokodemo.Settings.FollowRedirect = true
-
-	}
+	dokodemo.StreamSettings = &coreObj.StreamSettings{Sockopt: &coreObj.Sockopt{Tproxy: &tproxy}}
+	dokodemo.Settings.FollowRedirect = true
 	t.Inbounds = append(t.Inbounds, dokodemo)
 }
 
@@ -878,6 +896,13 @@ func (t *Template) setDualStack() {
 	if !t.Setting.PortSharing {
 		// copy a group of ipv6 inbounds and set the tag
 		for i := range t.Inbounds {
+			if t.Inbounds[i].Tag == "transparent" && t.Setting.TransparentType == configure.TransparentRedirect {
+				// https://ipset.netfilter.org/iptables-extensions.man.html#lbDK
+				// REDIRECT redirects the packet to the machine itself by changing the destination IP to the primary address of the incoming interface.
+				// So we should listen at 0.0.0.0 instead of 127.0.0.1
+				inbounds6[i].Tag = "THIS_IS_A_DROPPED_TAG"
+				continue
+			}
 			if t.Inbounds[i].Tag == "dns-in" {
 				t.Inbounds[i].Listen = "127.2.0.17"
 				inbounds6[i].Tag = "THIS_IS_A_DROPPED_TAG"
@@ -947,14 +972,14 @@ func (t *Template) setDualStack() {
 	}
 }
 func (t *Template) setInboundFakeDnsDestOverride() {
-	if t.FakeDns == nil {
+	if !specialMode.ShouldUseFakeDns() {
 		return
 	}
 	for i := range t.Inbounds {
 		if t.Inbounds[i].Sniffing.Enabled == false {
 			continue
 		}
-		t.Inbounds[i].Sniffing.DestOverride = append(t.Inbounds[i].Sniffing.DestOverride, "fakedns")
+		t.Inbounds[i].Sniffing.DestOverride = []string{"fakedns"}
 	}
 }
 
@@ -962,6 +987,8 @@ func (t *Template) appendDNSOutbound() {
 	t.Outbounds = append(t.Outbounds, coreObj.OutboundObject{
 		Tag:      "dns-out",
 		Protocol: "dns",
+		// Fallback DNS for non-A/AAAA/CNAME requests. https://github.com/v2rayA/v2rayA/issues/188
+		Settings: coreObj.Settings{Address: "119.29.29.29", Port: 53, Network: "udp"},
 	})
 }
 
@@ -999,8 +1026,9 @@ func (t *Template) setInbound() error {
 	if p != nil {
 		t.Inbounds[0].Port = p.Socks5
 		t.Inbounds[1].Port = p.Http
-		t.Inbounds[2].Port = p.HttpWithPac
-		vmess := &t.Inbounds[3]
+		t.Inbounds[2].Port = p.Socks5WithPac
+		t.Inbounds[3].Port = p.HttpWithPac
+		vmess := &t.Inbounds[4]
 		vmess.Port = p.Vmess
 		if p.Vmess > 0 {
 			if err := SetVmessInbound(vmess); err != nil {
@@ -1014,13 +1042,19 @@ func (t *Template) setInbound() error {
 			t.Inbounds = append(t.Inbounds[:i], t.Inbounds[i+1:]...)
 		}
 	}
-	if t.Setting.Transparent != configure.TransparentClose {
-		var tproxy string
+	if IsTransparentOn(t.Setting) {
 		switch t.Setting.TransparentType {
 		case configure.TransparentTproxy, configure.TransparentRedirect:
-			tproxy = string(t.Setting.TransparentType)
+			t.AppendDokodemoTProxy(string(t.Setting.TransparentType), 52345, "transparent")
+		case configure.TransparentSystemProxy:
+			t.Inbounds = append(t.Inbounds, coreObj.Inbound{
+				Port:     52345,
+				Protocol: "http",
+				Listen:   "127.0.0.1",
+				Tag:      "transparent",
+			})
 		}
-		t.AppendDokodemo(&tproxy, 32345, "transparent")
+
 	}
 	if specialMode.ShouldLocalDnsListen() {
 		if couldListenLocalhost, _ := specialMode.CouldLocalDnsListen(); couldListenLocalhost {
@@ -1032,6 +1066,9 @@ func (t *Template) setInbound() error {
 				Listen:   "0.0.0.0",
 				Settings: &coreObj.InboundSettings{
 					Network: "udp",
+					// the non-A/AAAA/CNAME problem has been fixed by the setting in DNS outbound.
+					// so the Address here is innocuous.
+					// related commit: https://github.com/v2rayA/v2rayA/commit/ecbf915d4be8b9066955a21059519266bcca6b92
 					Address: "2.0.1.7",
 					Port:    53,
 				},
@@ -1068,7 +1105,7 @@ func (t *Template) updatePrivateRouting() {
 }
 
 func (t *Template) optimizeGeoipMemoryOccupation() {
-	if asset.IsGeoipOnlyCnPrivateExists() {
+	if asset.DoesV2rayAssetExist("geoip-only-cn-private.dat") {
 		for i := range t.Routing.Rules {
 			for j := range t.Routing.Rules[i].IP {
 				switch t.Routing.Rules[i].IP[j] {
@@ -1104,62 +1141,13 @@ func (t *Template) setWhitelistRouting(whitelist []Addr) {
 	}
 }
 
-func (t *Template) setGroupRouting(serverData *ServerData) (err error) {
+func (t *Template) setGroupRouting() {
 	outbounds := t.outNames()
-	for outbound, isGroup := range outbounds {
-		if !isGroup {
-			continue
-		}
-
-		//TODO: random, leastload
-		strategy := serverData.OutboundName2Setting[outbound].Type
-		interval, err := time.ParseDuration(serverData.OutboundName2Setting[outbound].ProbeInterval)
-		if err != nil {
-			log.Warn("observatory: %v", err)
-			interval = 10 * time.Second
-		}
-		var selector []string
-
-		for _, vi := range serverData.OutboundName2ServerObjs[outbound] {
-			selector = append(selector, GroupWrapper(vi.GetName()))
-		}
-
-		t.Routing.Balancers = append(t.Routing.Balancers, coreObj.Balancer{
-			Tag:      outbound,
-			Selector: selector,
-			Strategy: coreObj.BalancerStrategy{
-				Type: strategy.String(),
-				Settings: &coreObj.StrategySettings{
-					ObserverTag: outbound,
-				},
-			},
-		})
-
-		if strings.ToLower(strategy.String()) == "leastping" {
-			if t.MultiObservatory == nil {
-				t.MultiObservatory = &coreObj.MultiObservatory{}
-			}
-			probeUrl := serverData.OutboundName2Setting[outbound].ProbeURL
-			if _, err := url.Parse(probeUrl); err != nil {
-				log.Warn("observatory: %v", err)
-				probeUrl = "http://www.msftconnecttest.com/connecttest.txt"
-			}
-			t.MultiObservatory.Observers = append(t.MultiObservatory.Observers, coreObj.ObservatoryItem{
-				Tag: outbound,
-				Settings: coreObj.Observatory{
-					SubjectSelector: selector,
-					ProbeURL:        probeUrl,
-					ProbeInterval:   interval.String(),
-				},
-			})
-		}
-	}
 	for i := range t.Routing.Rules {
 		if t.Routing.Rules[i].OutboundTag != "" && outbounds[t.Routing.Rules[i].OutboundTag] == true {
 			t.Routing.Rules[i].BalancerTag, t.Routing.Rules[i].OutboundTag = t.Routing.Rules[i].OutboundTag, ""
 		}
 	}
-	return nil
 }
 
 type ServerData struct {
@@ -1264,9 +1252,9 @@ func (t *Template) resolveOutbounds(
 			usedByBalancer     bool
 			balancerPluginPort int
 		)
-		// a vmessInfo(server template) may is used by multiple serverInfos(a connected server)
+		// an vmessInfo(server template) may be used by multiple serverInfos(a connected server)
 
-		// outbound name is not just v2ray outbound tag, it may is a balancer
+		// outbound name is not just v2ray outbound tag, it may be a balancer
 		type balancer struct {
 			name       string
 			serverInfo *serverInfo
@@ -1287,6 +1275,7 @@ func (t *Template) resolveOutbounds(
 				// pure outbound
 				outboundTag := sInfo.OutboundName
 				c, err := obj.Configuration(serverObj.PriorInfo{
+					Variant:     t.Variant,
 					CoreVersion: t.CoreVersion,
 					Tag:         outboundTag,
 					PluginPort:  sInfo.PluginPort,
@@ -1295,6 +1284,12 @@ func (t *Template) resolveOutbounds(
 					return nil, nil, err
 				}
 				extraOutbounds = append(extraOutbounds, c.ExtraOutbounds...)
+				if c.PluginManagerServerLink != "" {
+					t.PluginManagerInfoList = append(t.PluginManagerInfoList, PluginManagerInfo{
+						Link: c.PluginManagerServerLink,
+						Port: sInfo.PluginPort,
+					})
+				}
 				var s plugin.Server
 				if len(c.PluginChain) > 0 {
 					s, err = plugin.ServerFromChain(c.PluginChain)
@@ -1316,6 +1311,7 @@ func (t *Template) resolveOutbounds(
 			// the v2ray outbound is shared by balancers
 			outboundTag := GroupWrapper(obj.GetName())
 			c, err := obj.Configuration(serverObj.PriorInfo{
+				Variant:     t.Variant,
 				CoreVersion: t.CoreVersion,
 				Tag:         outboundTag,
 				PluginPort:  balancerPluginPort,
@@ -1327,7 +1323,12 @@ func (t *Template) resolveOutbounds(
 			for _, v := range balancers {
 				c.CoreOutbound.Balancers = append(c.CoreOutbound.Balancers, v.name)
 			}
-
+			if c.PluginManagerServerLink != "" {
+				t.PluginManagerInfoList = append(t.PluginManagerInfoList, PluginManagerInfo{
+					Link: c.PluginManagerServerLink,
+					Port: balancerPluginPort,
+				})
+			}
 			// we use the lowest serverInfo index as the order weight of the balancer outbound
 			weight := -1
 			for _, v := range balancers {
@@ -1384,7 +1385,7 @@ func (t *Template) resolveOutbounds(
 	return supportUDP, outboundTags, nil
 }
 
-func (t *Template) SetAPI() (port int) {
+func (t *Template) SetAPI(serverData *ServerData) (port int, err error) {
 	services := []string{
 		"LoggerService",
 	}
@@ -1395,18 +1396,70 @@ func (t *Template) SetAPI() (port int) {
 			_ = l.Close()
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(30 * time.Millisecond)
 	}
-	if t.MultiObservatory != nil {
-		services = append(services, "ObservatoryService")
+	// observatory
+	if serverData != nil {
+		outbounds := t.outNames()
+		for outbound, isGroup := range outbounds {
+			if !isGroup {
+				continue
+			}
 
-		var observatoryTags []string
-		for name, isGroup := range t.outNames() {
-			if isGroup {
-				observatoryTags = append(observatoryTags, name)
+			//TODO: random, leastload
+			strategy := serverData.OutboundName2Setting[outbound].Type
+			interval, err := time.ParseDuration(serverData.OutboundName2Setting[outbound].ProbeInterval)
+			if err != nil {
+				log.Warn("observatory: %v", err)
+				interval = 10 * time.Second
+			}
+			var selector []string
+
+			for _, vi := range serverData.OutboundName2ServerObjs[outbound] {
+				selector = append(selector, GroupWrapper(vi.GetName()))
+			}
+
+			t.Routing.Balancers = append(t.Routing.Balancers, coreObj.Balancer{
+				Tag:      outbound,
+				Selector: selector,
+				Strategy: coreObj.BalancerStrategy{
+					Type: strategy.String(),
+					Settings: &coreObj.StrategySettings{
+						ObserverTag: outbound,
+					},
+				},
+			})
+
+			if strings.ToLower(strategy.String()) == "leastping" {
+				if t.MultiObservatory == nil {
+					t.MultiObservatory = &coreObj.MultiObservatory{}
+				}
+				probeUrl := serverData.OutboundName2Setting[outbound].ProbeURL
+				if _, err := url.Parse(probeUrl); err != nil {
+					log.Warn("observatory: %v", err)
+					probeUrl = "https://gstatic.com/generate_204"
+				}
+				t.MultiObservatory.Observers = append(t.MultiObservatory.Observers, coreObj.ObservatoryItem{
+					Tag: outbound,
+					Settings: coreObj.Observatory{
+						SubjectSelector: selector,
+						ProbeURL:        probeUrl,
+						ProbeInterval:   interval.String(),
+					},
+				})
 			}
 		}
-		t.ApiCloses = append(t.ApiCloses, ObservatoryProducer(port, observatoryTags))
+		if t.MultiObservatory != nil {
+			services = append(services, "ObservatoryService")
+
+			var observatoryTags []string
+			for name, isGroup := range t.outNames() {
+				if isGroup {
+					observatoryTags = append(observatoryTags, name)
+				}
+			}
+			t.ApiCloses = append(t.ApiCloses, ObservatoryProducer(port, observatoryTags))
+		}
 	}
 	t.API = &coreObj.APIObject{
 		Tag:      "api-out",
@@ -1428,7 +1481,7 @@ func (t *Template) SetAPI() (port int) {
 		OutboundTag: "api-out",
 	})
 	t.ApiPort = port
-	return port
+	return port, nil
 }
 
 func (t *Template) setVmessInboundRouting() {
@@ -1438,7 +1491,7 @@ func (t *Template) setVmessInboundRouting() {
 	for i := range t.Routing.Rules {
 		var bHasRule bool
 		for _, tag := range t.Routing.Rules[i].InboundTag {
-			if tag == "rule" {
+			if tag == "rule-http" {
 				bHasRule = true
 			}
 		}
@@ -1463,7 +1516,7 @@ func NewTemplate(serverInfos []serverInfo, setting *configure.Setting) (t *Templ
 	if err != nil {
 		return nil, fmt.Errorf("error occurs while reading template json, please check whether templateJson variable is correct json format")
 	}
-	tmplJson.CoreVersion, _ = where.GetV2rayServiceVersion()
+	tmplJson.Variant, tmplJson.CoreVersion, _ = where.GetV2rayServiceVersion()
 	t = &tmplJson
 	t.Setting = setting
 	// log
@@ -1505,22 +1558,19 @@ func NewTemplate(serverInfos []serverInfo, setting *configure.Setting) (t *Templ
 		return nil, err
 	}
 	//transparent routing
-	if t.Setting.Transparent != configure.TransparentClose {
+	if IsTransparentOn(setting) {
 		if err = t.setTransparentRouting(); err != nil {
 			return nil, err
 		}
-	}
-	//set group routing
-	if err = t.setGroupRouting(serverData); err != nil {
-		return nil, err
 	}
 	//set vmess inbound routing
 	t.setVmessInboundRouting()
 	// set api
 	if t.API == nil {
-		t.SetAPI()
+		if _, err = t.SetAPI(serverData); err != nil {
+			return nil, err
+		}
 	}
-
 	// set routing whitelist
 	var whitelist []Addr
 	for _, info := range serverInfos {
@@ -1536,6 +1586,12 @@ func NewTemplate(serverInfos []serverInfo, setting *configure.Setting) (t *Templ
 	t.setWhitelistRouting(whitelist)
 
 	t.updatePrivateRouting()
+
+	// add spare tire outbound routing. Fix: https://github.com/v2rayA/v2rayA/issues/447
+	t.Routing.Rules = append(t.Routing.Rules, coreObj.RoutingRule{Type: "field", Port: "0-65535", OutboundTag: "proxy"})
+
+	// Set group routing. This should be put in the end of routing setters.
+	t.setGroupRouting()
 
 	t.optimizeGeoipMemoryOccupation()
 
@@ -1680,7 +1736,7 @@ func WriteV2rayConfig(content []byte) (err error) {
 
 func NewEmptyTemplate(setting *configure.Setting) (t *Template) {
 	t = new(Template)
-	t.CoreVersion, _ = where.GetV2rayServiceVersion()
+	t.Variant, t.CoreVersion, _ = where.GetV2rayServiceVersion()
 	if setting != nil {
 		setting.FillEmpty()
 	} else {
@@ -1691,7 +1747,7 @@ func NewEmptyTemplate(setting *configure.Setting) (t *Template) {
 }
 
 func (t *Template) checkAndSetMark(o *coreObj.OutboundObject, mark int) {
-	if t.Setting.Transparent == configure.TransparentClose {
+	if !IsTransparentOn(t.Setting) {
 		return
 	}
 	if o.StreamSettings == nil {
@@ -1705,9 +1761,10 @@ func (t *Template) checkAndSetMark(o *coreObj.OutboundObject, mark int) {
 
 func (t *Template) InsertMappingOutbound(o serverObj.ServerObj, inboundPort string, udpSupport bool, pluginPort int, protocol string) (err error) {
 	if t.CoreVersion == "" {
-		t.CoreVersion, _ = where.GetV2rayServiceVersion()
+		t.Variant, t.CoreVersion, _ = where.GetV2rayServiceVersion()
 	}
 	c, err := o.Configuration(serverObj.PriorInfo{
+		Variant:     t.Variant,
 		CoreVersion: t.CoreVersion,
 		Tag:         "outbound" + inboundPort,
 		PluginPort:  pluginPort,
@@ -1721,6 +1778,12 @@ func (t *Template) InsertMappingOutbound(o serverObj.ServerObj, inboundPort stri
 		} else {
 			t.Plugins = append(t.Plugins, server)
 		}
+	}
+	if c.PluginManagerServerLink != "" {
+		t.PluginManagerInfoList = append(t.PluginManagerInfoList, PluginManagerInfo{
+			Link: c.PluginManagerServerLink,
+			Port: pluginPort,
+		})
 	}
 	var mark = 0x80
 	t.checkAndSetMark(&c.CoreOutbound, mark)
@@ -1738,7 +1801,7 @@ func (t *Template) InsertMappingOutbound(o serverObj.ServerObj, inboundPort stri
 		Protocol: protocol,
 		Listen:   "0.0.0.0",
 		Sniffing: coreObj.Sniffing{
-			Enabled:      true,
+			Enabled:      false,
 			DestOverride: []string{"http", "tls"},
 		},
 		Settings: &coreObj.InboundSettings{

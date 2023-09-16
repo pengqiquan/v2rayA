@@ -73,3 +73,11 @@ html{
 .code-font {
   font-family: sarasa inter regular, Consolas, monospace, Monaco, Menlo, Courier New;
 }
+
+.noscroll{
+  overflow: hidden;
+}
+
+.field.is-floating-label .label {
+  overflow: visible !important;
+}

@@ -1,8 +1,8 @@
 package where
 
 import (
+	"bytes"
 	"fmt"
-	"github.com/v2rayA/v2rayA/conf"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,74 +10,68 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/v2rayA/v2rayA/conf"
+)
+
+type Variant string
+
+const (
+	Unknown Variant = "Unknown"
+	V2ray   Variant = "V2Ray"
+	Xray    Variant = "Xray"
 )
 
 var NotFoundErr = fmt.Errorf("not found")
-var ServiceNameList = []string{"v2ray"}
+var ServiceNameList = []string{"xray", "v2ray"}
 var v2rayVersion struct {
+	variant    Variant
 	version    string
 	lastUpdate time.Time
 	mu         sync.Mutex
 }
 
-type onceWriter struct {
-	buf      []byte
-	callback func(buf []byte)
-}
-
-func newOnceWriter(callback func(buf []byte)) *onceWriter {
-	return &onceWriter{
-		callback: callback,
-	}
-}
-
-func (r *onceWriter) Write(p []byte) (n int, err error) {
-	defer func() {
-		go r.callback(r.buf)
-	}()
-	r.buf = make([]byte, len(p))
-	copy(r.buf, p)
-	return len(p), nil
-}
-
 /* get the version of v2ray-core without 'v' like 4.23.1 */
-func GetV2rayServiceVersion() (ver string, err error) {
+func GetV2rayServiceVersion() (variant Variant, ver string, err error) {
 	// cache for 10 seconds
 	v2rayVersion.mu.Lock()
 	defer v2rayVersion.mu.Unlock()
 	if time.Since(v2rayVersion.lastUpdate) < 10*time.Second {
-		return v2rayVersion.version, nil
+		return v2rayVersion.variant, v2rayVersion.version, nil
 	}
 	v2rayPath, err := GetV2rayBinPath()
 	if err != nil || len(v2rayPath) <= 0 {
-		return "", fmt.Errorf("cannot find v2ray executable binary")
+		return Unknown, "", fmt.Errorf("cannot find v2ray executable binary")
 	}
-	var output []byte
-	var done = make(chan struct{}, 2)
 	cmd := exec.Command(v2rayPath, "version")
-	cmd.Stdout = newOnceWriter(func(buf []byte) {
-		output = buf
-		done <- struct{}{}
-	})
-	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
-		return "", err
-	}
+	output := bytes.NewBuffer(nil)
+	cmd.Stdout = output
+	cmd.Stderr = output
 	go func() {
-		time.Sleep(3 * time.Second)
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-		done <- struct{}{}
+		time.Sleep(5 * time.Second)
+		p := cmd.Process
+		if p != nil {
+			_ = p.Kill()
+		}
 	}()
-	<-done
+	if err := cmd.Start(); err != nil {
+		return Unknown, "", err
+	}
+	cmd.Wait()
 	var fields []string
-	if fields = strings.Fields(strings.TrimSpace(string(output))); len(fields) < 2 {
-		return "", fmt.Errorf("cannot parse version of v2ray")
+	if fields = strings.Fields(strings.TrimSpace(output.String())); len(fields) < 2 {
+		return Unknown, "", fmt.Errorf("cannot parse version of v2ray")
 	}
 	ver = fields[1]
-	if strings.ToUpper(fields[0]) != "V2RAY" {
-		ver = "UnknownClient"
+	switch strings.ToUpper(fields[0]) {
+	case "V2RAY":
+		variant = V2ray
+	case "XRAY":
+		variant = Xray
+	default:
+		variant = Unknown
 	}
+	v2rayVersion.variant = variant
 	v2rayVersion.version = ver
 	v2rayVersion.lastUpdate = time.Now()
 	return

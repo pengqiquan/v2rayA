@@ -4,8 +4,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/v2rayA/v2rayA/common"
 	"github.com/v2rayA/v2rayA/conf"
-	"github.com/v2rayA/v2rayA/core/v2ray/asset/gfwlist"
+	"github.com/v2rayA/v2rayA/core/v2ray/asset/dat"
 	"github.com/v2rayA/v2rayA/core/v2ray/service"
+	"github.com/v2rayA/v2rayA/core/v2ray/where"
 	"net/http"
 )
 
@@ -14,14 +15,16 @@ func GetVersion(ctx *gin.Context) {
 	if conf.GetEnvironmentConfig().Lite {
 		lite = 1
 	}
-	v5 := service.CheckV5() == nil
+	variant, versionErr := service.CheckV5()
 	common.ResponseSuccess(ctx, gin.H{
-		"version":       conf.Version,
-		"foundNew":      conf.FoundNew,
-		"remoteVersion": conf.RemoteVersion,
-		"serviceValid":  service.IsV2rayServiceValid(),
-		"v5":            v5,
-		"lite":          lite,
+		"version":          conf.Version,
+		"foundNew":         conf.FoundNew,
+		"remoteVersion":    conf.RemoteVersion,
+		"serviceValid":     service.IsV2rayServiceValid(),
+		"v5":               versionErr == nil, // FIXME: Compomise on compatibility.
+		"lite":             lite,
+		"loadBalanceValid": variant == where.V2ray && versionErr == nil,
+		"variant":          variant,
 	})
 }
 
@@ -31,7 +34,7 @@ func GetRemoteGFWListVersion(ctx *gin.Context) {
 	//	tools.ResponseError(ctx, err)
 	//	return
 	//}
-	g, err := gfwlist.GetRemoteGFWListUpdateTime(http.DefaultClient)
+	g, err := dat.GetRemoteGFWListUpdateTime(http.DefaultClient)
 	if err != nil {
 		common.ResponseError(ctx, logError(err))
 		return
